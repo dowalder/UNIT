@@ -3,7 +3,8 @@ Copyright (C) 2017 NVIDIA Corporation.  All rights reserved.
 Licensed under the CC BY-NC-SA 4.0 license (https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode).
 """
 from networks import AdaINGen, MsImageDis, VAEGen
-from utils import weights_init, get_model_list, vgg_preprocess, load_vgg16, get_scheduler
+from utils import weights_init, get_model_list, vgg_preprocess, load_vgg16, get_scheduler, normalize_batch
+import vgg
 from torch.autograd import Variable
 import torch
 import torch.nn as nn
@@ -209,6 +210,7 @@ class UNIT_Trainer(nn.Module):
         self.dis_a = MsImageDis(hyperparameters['input_dim_a'], hyperparameters['dis'])  # discriminator for domain a
         self.dis_b = MsImageDis(hyperparameters['input_dim_b'], hyperparameters['dis'])  # discriminator for domain b
         self.instancenorm = nn.InstanceNorm2d(512, affine=False)
+        self.mse_loss = nn.MSELoss()
 
         # Setup the optimizers
         beta1 = hyperparameters['beta1']
@@ -232,6 +234,12 @@ class UNIT_Trainer(nn.Module):
             self.vgg = load_vgg16(hyperparameters['vgg_model_path'] + '/models')
             self.vgg.eval()
             for param in self.vgg.parameters():
+                param.requires_grad = False
+
+        if "vgg_content" in hyperparameters.keys() and hyperparameters["vgg_content"] > 0:
+            self.vgg_content = vgg.Vgg16()
+            self.vgg_content.eval()
+            for param in self.vgg_content.parameters():
                 param.requires_grad = False
 
     def recon_criterion(self, input, target):
@@ -289,6 +297,9 @@ class UNIT_Trainer(nn.Module):
         # domain-invariant perceptual loss
         self.loss_gen_vgg_a = self.compute_vgg_loss(self.vgg, x_ba, x_b) if hyperparameters['vgg_w'] > 0 else 0
         self.loss_gen_vgg_b = self.compute_vgg_loss(self.vgg, x_ab, x_a) if hyperparameters['vgg_w'] > 0 else 0
+        # content loss
+        self.loss_gen_vgg_content_a = self.compute_content_loss(x_ab, x_a) if hyperparameters['vgg_content'] > 0 else 0
+        self.loss_gen_vgg_content_b = self.compute_content_loss(x_ba, x_b) if hyperparameters['vgg_content'] > 0 else 0
         # total loss
         self.loss_gen_total = hyperparameters['gan_w'] * self.loss_gen_adv_a + \
                               hyperparameters['gan_w'] * self.loss_gen_adv_b + \
@@ -301,7 +312,9 @@ class UNIT_Trainer(nn.Module):
                               hyperparameters['recon_x_cyc_w'] * self.loss_gen_cyc_x_b + \
                               hyperparameters['recon_kl_cyc_w'] * self.loss_gen_recon_kl_cyc_bab + \
                               hyperparameters['vgg_w'] * self.loss_gen_vgg_a + \
-                              hyperparameters['vgg_w'] * self.loss_gen_vgg_b
+                              hyperparameters['vgg_w'] * self.loss_gen_vgg_b + \
+                              hyperparameters['vgg_content'] * self.loss_gen_vgg_content_a + \
+                              hyperparameters['vgg_content'] * self.loss_gen_vgg_content_b
         self.loss_gen_total.backward()
         self.gen_opt.step()
 
@@ -311,6 +324,12 @@ class UNIT_Trainer(nn.Module):
         img_fea = vgg(img_vgg)
         target_fea = vgg(target_vgg)
         return torch.mean((self.instancenorm(img_fea) - self.instancenorm(target_fea)) ** 2)
+
+    def compute_content_loss(self, img, target):
+        features_y = self.vgg_content(img)
+        features_x = self.vgg_content(target)
+
+        return self.mse_loss(features_y.relu2_2, features_x.relu2_2)
 
     def sample(self, x_a, x_b):
         self.eval()
