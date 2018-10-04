@@ -156,10 +156,11 @@ class VAEGen(nn.Module):
         n_res = params['n_res']
         activ = params['activ']
         pad_type = params['pad_type']
+        coord_conv = params['coord_conv']
 
         # content encoder
-        self.enc = ContentEncoder(n_downsample, n_res, input_dim, dim, 'in', activ, pad_type=pad_type)
-        self.dec = Decoder(n_downsample, n_res, self.enc.output_dim, input_dim, res_norm='in', activ=activ, pad_type=pad_type)
+        self.enc = ContentEncoder(n_downsample, n_res, input_dim, dim, 'in', activ, pad_type=pad_type, coord_conv=coord_conv)
+        self.dec = Decoder(n_downsample, n_res, self.enc.output_dim, input_dim, res_norm='in', activ=activ, pad_type=pad_type, coord_conv=coord_conv)
 
     def forward(self, images):
         # This is a reduced VAE implementation where we assume the outputs are multivariate Gaussian distribution with mean = hiddens and std_dev = all ones.
@@ -204,13 +205,13 @@ class StyleEncoder(nn.Module):
         return self.model(x)
 
 class ContentEncoder(nn.Module):
-    def __init__(self, n_downsample, n_res, input_dim, dim, norm, activ, pad_type):
+    def __init__(self, n_downsample, n_res, input_dim, dim, norm, activ, pad_type, coord_conv=False):
         super(ContentEncoder, self).__init__()
         self.model = []
-        self.model += [Conv2dBlock(input_dim, dim, 7, 1, 3, norm=norm, activation=activ, pad_type=pad_type)]
+        self.model += [Conv2dBlock(input_dim, dim, 7, 1, 3, norm=norm, activation=activ, pad_type=pad_type, coord_conv=coord_conv)]
         # downsampling blocks
         for i in range(n_downsample):
-            self.model += [Conv2dBlock(dim, 2 * dim, 4, 2, 1, norm=norm, activation=activ, pad_type=pad_type)]
+            self.model += [Conv2dBlock(dim, 2 * dim, 4, 2, 1, norm=norm, activation=activ, pad_type=pad_type, coord_conv=coord_conv)]
             dim *= 2
         # residual blocks
         self.model += [ResBlocks(n_res, dim, norm=norm, activation=activ, pad_type=pad_type)]
@@ -221,7 +222,8 @@ class ContentEncoder(nn.Module):
         return self.model(x)
 
 class Decoder(nn.Module):
-    def __init__(self, n_upsample, n_res, dim, output_dim, res_norm='adain', activ='relu', pad_type='zero'):
+    def __init__(self, n_upsample, n_res, dim, output_dim, res_norm='adain', activ='relu', pad_type='zero',
+                 coord_conv=False):
         super(Decoder, self).__init__()
 
         self.model = []
@@ -230,10 +232,10 @@ class Decoder(nn.Module):
         # upsampling blocks
         for i in range(n_upsample):
             self.model += [nn.Upsample(scale_factor=2),
-                           Conv2dBlock(dim, dim // 2, 5, 1, 2, norm='ln', activation=activ, pad_type=pad_type)]
+                           Conv2dBlock(dim, dim // 2, 5, 1, 2, norm='ln', activation=activ, pad_type=pad_type, coord_conv=coord_conv)]
             dim //= 2
         # use reflection padding in the last conv layer
-        self.model += [Conv2dBlock(dim, output_dim, 7, 1, 3, norm='none', activation='tanh', pad_type=pad_type)]
+        self.model += [Conv2dBlock(dim, output_dim, 7, 1, 3, norm='none', activation='tanh', pad_type=pad_type, coord_conv=coord_conv)]
         self.model = nn.Sequential(*self.model)
 
     def forward(self, x):
@@ -245,10 +247,13 @@ class Decoder(nn.Module):
 class ResBlocks(nn.Module):
     def __init__(self, num_blocks, dim, norm='in', activation='relu', pad_type='zero'):
         super(ResBlocks, self).__init__()
-        self.model = []
-        for i in range(num_blocks):
-            self.model += [ResBlock(dim, norm=norm, activation=activation, pad_type=pad_type)]
-        self.model = nn.Sequential(*self.model)
+        if num_blocks:
+            self.model = []
+            for i in range(num_blocks):
+                self.model += [ResBlock(dim, norm=norm, activation=activation, pad_type=pad_type)]
+            self.model = nn.Sequential(*self.model)
+        else:
+            self.model = Identity()
 
     def forward(self, x):
         return self.model(x)
@@ -270,6 +275,14 @@ class MLP(nn.Module):
 ##################################################################################
 # Basic Blocks
 ##################################################################################
+class Identity(nn.Module):
+    def __init__(self):
+        super(Identity, self).__init__()
+
+    def forward(self, x):
+        return x
+
+
 class ResBlock(nn.Module):
     def __init__(self, dim, norm='in', activation='relu', pad_type='zero'):
         super(ResBlock, self).__init__()
@@ -287,7 +300,7 @@ class ResBlock(nn.Module):
 
 class Conv2dBlock(nn.Module):
     def __init__(self, input_dim ,output_dim, kernel_size, stride,
-                 padding=0, norm='none', activation='relu', pad_type='zero'):
+                 padding=0, norm='none', activation='relu', pad_type='zero', coord_conv=False):
         super(Conv2dBlock, self).__init__()
         self.use_bias = True
         # initialize padding
@@ -333,7 +346,10 @@ class Conv2dBlock(nn.Module):
             assert 0, "Unsupported activation: {}".format(activation)
 
         # initialize convolution
-        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size, stride, bias=self.use_bias)
+        if coord_conv:
+            self.conv = nn.Conv2d(input_dim, output_dim, kernel_size, stride, bias=self.use_bias)
+        else:
+            self.conv = CoordConvTh(input_dim, output_dim, kernel_size, stride, bias=self.use_bias)
 
     def forward(self, x):
         x = self.conv(self.pad(x))
@@ -386,6 +402,75 @@ class LinearBlock(nn.Module):
         if self.activation:
             out = self.activation(out)
         return out
+
+####################################################################################
+# CoordConv implementation from https://github.com/mkocabas/CoordConv-pytorch      #
+####################################################################################
+
+
+class AddCoordsTh(nn.Module):
+    def __init__(self, x_dim=64, y_dim=64, with_r=False):
+        super(AddCoordsTh, self).__init__()
+        self.x_dim = x_dim
+        self.y_dim = y_dim
+        self.with_r = with_r
+
+    def forward(self, input_tensor):
+        """
+        input_tensor: (batch, c, x_dim, y_dim)
+        """
+        batch_size_tensor = input_tensor.shape[0]
+
+        xx_ones = torch.ones([1, self.y_dim], dtype=torch.int32)
+        xx_ones = xx_ones.unsqueeze(-1)
+
+        xx_range = torch.arange(self.x_dim, dtype=torch.int32).unsqueeze(0)
+        xx_range = xx_range.unsqueeze(1)
+
+        xx_channel = torch.matmul(xx_ones, xx_range)
+        xx_channel = xx_channel.unsqueeze(-1)
+
+        yy_ones = torch.ones([1, self.x_dim], dtype=torch.int32)
+        yy_ones = yy_ones.unsqueeze(1)
+
+        yy_range = torch.arange(self.y_dim, dtype=torch.int32).unsqueeze(0)
+        yy_range = yy_range.unsqueeze(-1)
+
+        yy_channel = torch.matmul(yy_range, yy_ones)
+        yy_channel = yy_channel.unsqueeze(-1)
+
+        xx_channel = xx_channel.permute(0, 3, 2, 1)
+        yy_channel = yy_channel.permute(0, 3, 2, 1)
+
+        xx_channel = xx_channel.float() / (self.x_dim - 1)
+        yy_channel = yy_channel.float() / (self.y_dim - 1)
+
+        xx_channel = xx_channel * 2 - 1
+        yy_channel = yy_channel * 2 - 1
+
+        xx_channel = xx_channel.repeat(batch_size_tensor, 1, 1, 1)
+        yy_channel = yy_channel.repeat(batch_size_tensor, 1, 1, 1)
+
+        ret = torch.cat([input_tensor, xx_channel, yy_channel], dim=1)
+
+        if self.with_r:
+            rr = torch.sqrt(torch.pow(xx_channel - 0.5, 2) + torch.pow(yy_channel - 0.5, 2))
+            ret = torch.cat([ret, rr], dim=1)
+
+        return ret
+
+
+class CoordConvTh(nn.Module):
+    """CoordConv layer as in the paper."""
+    def __init__(self, x_dim, y_dim, with_r, *args, **kwargs):
+        super(CoordConvTh, self).__init__()
+        self.addcoords = AddCoordsTh(x_dim=x_dim, y_dim=y_dim, with_r=with_r)
+        self.conv = nn.Conv2d(*args, **kwargs)
+
+    def forward(self, input_tensor):
+        ret = self.addcoords(input_tensor)
+        ret = self.conv(ret)
+        return ret
 
 ##################################################################################
 # VGG network definition
