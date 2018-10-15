@@ -280,6 +280,12 @@ def weights_init(init_type='gaussian'):
     return init_fun
 
 
+def add_noise(img: torch.Tensor):
+    with torch.no_grad():
+        noise = img.new_empty(img.shape).normal_(0, 0.1)
+        return img + noise
+
+
 class Timer:
     def __init__(self, msg):
         self.msg = msg

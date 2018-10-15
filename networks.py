@@ -156,8 +156,8 @@ class VAEGen(nn.Module):
         n_res = params['n_res']
         activ = params['activ']
         pad_type = params['pad_type']
-        coord_conv = params['coord_conv']
-
+        # coord_conv = params['coord_conv']
+        coord_conv = False
         # content encoder
         self.enc = ContentEncoder(n_downsample, n_res, input_dim, dim, 'in', activ, pad_type=pad_type, coord_conv=coord_conv)
         self.dec = Decoder(n_downsample, n_res, self.enc.output_dim, input_dim, res_norm='in', activ=activ, pad_type=pad_type, coord_conv=coord_conv)

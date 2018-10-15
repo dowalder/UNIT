@@ -3,7 +3,7 @@ Copyright (C) 2017 NVIDIA Corporation.  All rights reserved.
 Licensed under the CC BY-NC-SA 4.0 license (https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode).
 """
 from networks import AdaINGen, MsImageDis, VAEGen
-from utils import weights_init, get_model_list, vgg_preprocess, load_vgg16, get_scheduler
+from utils import weights_init, get_model_list, vgg_preprocess, load_vgg16, get_scheduler, add_noise
 import vgg
 from torch.autograd import Variable
 import torch
@@ -241,6 +241,7 @@ class UNIT_Trainer(nn.Module):
             self.vgg_content.eval()
             for param in self.vgg_content.parameters():
                 param.requires_grad = False
+        self.add_noise = add_noise if "add_noise" in hyperparameters and hyperparameters["add_noise"] else None
 
     def recon_criterion(self, input, target):
         return torch.mean(torch.abs(input - target))
@@ -265,10 +266,11 @@ class UNIT_Trainer(nn.Module):
         return encoding_loss
 
     def gen_update(self, x_a, x_b, hyperparameters):
+        x_a_noise, x_b_noise = (self.add_noise(x_a), self.add_noise(x_b)) if self.add_noise else (x_a, x_b)
         self.gen_opt.zero_grad()
         # encode
-        h_a, n_a = self.gen_a.encode(x_a)
-        h_b, n_b = self.gen_b.encode(x_b)
+        h_a, n_a = self.gen_a.encode(x_a_noise)
+        h_b, n_b = self.gen_b.encode(x_b_noise)
         # decode (within domain)
         x_a_recon = self.gen_a.decode(h_a + n_a)
         x_b_recon = self.gen_b.decode(h_b + n_b)
